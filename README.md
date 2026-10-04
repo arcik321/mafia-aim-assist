@@ -12,28 +12,22 @@ controller through Steam Input, on a laptop or on a handheld.
 
 ## Install
 
-1. Download the latest `MafiaAimAssist-x.y.z.zip` from the Releases page and **extract it** (do not run the installer
-   from inside the zip).
-2. Run `Install.exe`. It finds Steam and GOG installs by itself, checks that `Game.exe` is a supported build, and
-   asks whether to install Xidi (say yes if you use a controller with Steam Input).
-   If the game is under `Program Files` and the installer reports an access error, run it as administrator.
-3. Set up the in-game controls once, as described below.
+1. Download the latest `MafiaAimAssist-x.y.z.zip` from the Releases page and extract it.
+2. Find the folder that contains `Game.exe` and `LS3DF.dll`
+   (Steam: `...\steamapps\common\Mafia\Mafia`, GOG: the folder you installed to).
+3. Copy these files from the zip's `files` folder into that folder:
+   - `dinput8.dll`, `MafiaAimLogic.dll`, `MafiaAimAssist.ini`
+   - Controller with Steam Input on Windows: also everything from `files\xidi` (`dinput.dll`, `Xidi.32.dll`,
+     `Xidi.ini`)
+4. Set up the in-game controls once, as described below.
 
-To remove the mod run `Install.exe /uninstall`. Files that were replaced are restored from `MafiaAimAssist_backup`.
-
-<details>
-<summary>Manual install</summary>
-
-Copy these files from the zip's `files` folder into the folder that contains `Game.exe` and `LS3DF.dll`
-(Steam: `...\steamapps\common\Mafia\Mafia`):
-
-- `dinput8.dll`, `MafiaAimLogic.dll`, `MafiaAimAssist.ini`
-- Controller with Steam Input on Windows: also everything from `files\xidi` (`dinput.dll`, `Xidi.32.dll`, `Xidi.ini`)
+If the game is under `Program Files` and Windows refuses to copy, run the copy as administrator.
 
 `dinput8.dll` is a proxy: the game loads it instead of the system DirectInput 8 library, and it forwards everything to
 the real one. If the folder already has a `dinput8.dll` from another mod (for example an ASI loader or the Widescreen
-Fix), the two cannot be used together.
-</details>
+Fix), the two cannot be used together; keep a backup of the original before overwriting it.
+
+To remove the mod, delete the files you copied (and restore any `dinput8.dll` you backed up).
 
 ## Required: in-game controls
 
@@ -67,7 +61,7 @@ Action = Button 3 (X), Jump = Button 1 (A), Crouch = Button 2 (B), Reload = Butt
 1. Connect the controller to Windows (USB or Bluetooth) **before** starting the game.
 2. In Steam open the game's **Properties > Controller** and set Steam Input to **Enable Steam Input**.
 3. Open the game's controller configuration and pick the plain **Gamepad** layout (not "Keyboard and mouse").
-4. Make sure Xidi was installed (the installer asks for it).
+4. Make sure the Xidi files from `files\xidi` were copied next to `Game.exe`.
 5. Launch the game **from Steam**, set the controls from the sections above, and play.
 
 The game only knows old DirectInput controllers. Steam Input hides the pad from DirectInput and shows an XInput
@@ -108,7 +102,7 @@ logs listed under [Troubleshooting](#troubleshooting).
 - **Nothing happens when holding the trigger:** check that the Aim control is `Mouse - Y axis` / `Mouse - X axis`
   and that a person is within about 80 metres in front of you. Aim assist is off while driving.
 - **The controller does nothing at all:** connect it before launching, enable Steam Input with the Gamepad layout,
-  and confirm Xidi is installed. Without Steam Input, Windows exposes the controller to the game directly.
+  and confirm the Xidi files are installed. Without Steam Input, Windows exposes the controller to the game directly.
 - **Camera spins or aim drifts the wrong way:** delete `%TEMP%\MafiaAimGain.cal` and try again; the mod relearns
   your mouse sensitivity in a few seconds of play.
 - **Logs:** `%TEMP%\MafiaAimLogic.log` and `%TEMP%\MafiaAimHost.log`. On SteamOS they are in the Proton prefix
@@ -118,7 +112,7 @@ logs listed under [Troubleshooting](#troubleshooting).
 
 The mod reads the game's memory at fixed addresses, so it only supports one executable: `Game.exe` with
 SHA-256 `303eb95ee2de3433511ce0cb518921dcb96b62b0f64ebfcc436723ff5083f298`. This is the Steam release and the GOG
-release, both version 1.3. Older retail builds are not supported; the installer warns before installing on them.
+release, both version 1.3. Older retail builds are not supported.
 
 ## Known limitations
 
@@ -140,13 +134,12 @@ lets the logic be replaced while the game runs.
 
 ## Build from source
 
-Requires Visual Studio with the C++ desktop tools. Run `build.bat`; it builds the three binaries, downloads Xidi
+Requires Visual Studio with the C++ desktop tools. Run `build.bat`; it builds the two DLLs, downloads Xidi
 (verifying its SHA-256) and writes `dist\MafiaAimAssist-<version>.zip`.
 
 ```
 src\MafiaAimLogic.c     aim logic, right stick, sensitivity learning (MafiaAimLogic.dll)
 src\MafiaAimHost.c      DirectInput proxy and hot reload host (dinput8.dll)
-installer\Installer.c   Install.exe
 config\                 default MafiaAimAssist.ini and Xidi.ini
 ```
 

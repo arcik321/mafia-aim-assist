@@ -17,16 +17,13 @@ call "%VS%\VC\Auxiliary\Build\vcvarsall.bat" x86 >nul || exit /b 1
 if not exist "%BUILD%" mkdir "%BUILD%"
 pushd "%BUILD%"
 
-echo [1/4] Building MafiaAimLogic.dll
+echo [1/3] Building MafiaAimLogic.dll
 cl /nologo /W4 /O2 /MT /TC "%ROOT%src\MafiaAimLogic.c" /LD /link /MACHINE:X86 user32.lib /OUT:MafiaAimLogic.dll || goto :fail
 
-echo [2/4] Building dinput8.dll (proxy)
+echo [2/3] Building dinput8.dll (proxy)
 cl /nologo /W4 /O2 /MT /TC /DBUILD_PROXY "%ROOT%src\MafiaAimHost.c" /LD /link /MACHINE:X86 user32.lib dxguid.lib /OUT:dinput8.dll || goto :fail
 
-echo [3/4] Building Install.exe
-cl /nologo /W4 /O2 /MT /TC "%ROOT%installer\Installer.c" /link /MACHINE:X86 advapi32.lib /OUT:Install.exe || goto :fail
-
-echo [4/4] Fetching Xidi and packaging
+echo [3/3] Fetching Xidi and packaging
 if not exist Xidi-v5.0.0.zip curl -L --fail -o Xidi-v5.0.0.zip "%XIDI_URL%" || goto :fail
 set "ACTUAL="
 for /f "skip=1 tokens=*" %%h in ('certutil -hashfile Xidi-v5.0.0.zip SHA256') do if not defined ACTUAL set "ACTUAL=%%h"
@@ -39,7 +36,6 @@ popd
 
 if exist "%PKG%" rmdir /s /q "%PKG%"
 mkdir "%PKG%\files\xidi"
-copy /y "%BUILD%\Install.exe" "%PKG%\Install.exe" >nul
 copy /y "%BUILD%\dinput8.dll" "%PKG%\files\dinput8.dll" >nul
 copy /y "%BUILD%\MafiaAimLogic.dll" "%PKG%\files\MafiaAimLogic.dll" >nul
 copy /y "%ROOT%config\MafiaAimAssist.ini" "%PKG%\files\MafiaAimAssist.ini" >nul
