@@ -91,6 +91,7 @@ logs listed under [Troubleshooting](#troubleshooting).
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `aim_height_cm` | `95` | Aim point above the target's feet. The default hits the torso of a standing person and the chest of a crouching one. Use about `120` to aim at the head of standing targets. |
+| `aim_key` | `O` | Keyboard key for lock-on. Set one letter/digit, `F1`-`F12`, `SPACE`, `ENTER`, `TAB`, `ESC`, `SHIFT`, `CTRL`, `ALT`, `CAPSLOCK` or `BACKSPACE`. The left trigger remains enabled. |
 | `aim_response_percent` | `70` | Lock-on strength. Lower it for a slower approach; accepted range is `25` to `150`. Changes are read while the game runs. |
 | `target_switch_stick` | `2` | While locked on, flick this stick sideways to switch to the nearest person on that side: `2` right stick (it does not look around while a target is locked), `1` left stick (also moves the character), `0` off. |
 | `right_stick_look` | `1` | Right stick moves the camera. Set `0` to disable. |

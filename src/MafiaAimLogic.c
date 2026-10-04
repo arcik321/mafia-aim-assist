@@ -306,13 +306,54 @@ typedef struct Config
     int deadzone;    /* percent of stick travel */
     int aimResponse; /* percentage scaling the lock-on controller */
     int switchStick; /* stick whose flick changes the locked target: 0 off, 1 left, 2 right */
+    int aimKey;      /* keyboard virtual key used for lock-on */
 } Config;
 
-static Config g_cfg = {1, 1100, 1000, 0, 15, 70, 2};
+static Config g_cfg = {1, 1100, 1000, 0, 15, 70, 2, 'O'};
 static char g_iniPath[MAX_PATH];
 static LONGLONG g_configNext;
 
 static int ClampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static int ParseAimKey(const char *name)
+{
+    int i;
+    if (!name || !name[0])
+        return 0;
+    if (name[1])
+    {
+        if (name && name[0] == 'F' && name[1] >= '1' && name[1] <= '9' && !name[2])
+            return VK_F1 + (name[1] - '1');
+        if (name && name[0] == 'F' && name[1] == '1' && name[2] >= '0' && name[2] <= '2' && !name[3])
+            return VK_F10 + (name[2] - '0');
+        if (name && name[0] == 'F' && name[1] == '1' && name[2] == '2' && !name[3])
+            return VK_F12;
+    }
+    else if ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z') ||
+             (name[0] >= '0' && name[0] <= '9'))
+        return (int)name[0] >= 'a' ? (int)name[0] - ('a' - 'A') : (int)name[0];
+    for (i = 0; i < 12; ++i)
+    {
+        char functionKey[4] = {'F', (char)('1' + i), '\0', '\0'};
+        if (i >= 9)
+        {
+            functionKey[1] = '1';
+            functionKey[2] = (char)('0' + i - 9);
+        }
+        if (lstrcmpiA(name, functionKey) == 0)
+            return VK_F1 + i;
+    }
+    if (lstrcmpiA(name, "SPACE") == 0) return VK_SPACE;
+    if (lstrcmpiA(name, "ENTER") == 0) return VK_RETURN;
+    if (lstrcmpiA(name, "TAB") == 0) return VK_TAB;
+    if (lstrcmpiA(name, "ESC") == 0 || lstrcmpiA(name, "ESCAPE") == 0) return VK_ESCAPE;
+    if (lstrcmpiA(name, "SHIFT") == 0) return VK_SHIFT;
+    if (lstrcmpiA(name, "CTRL") == 0 || lstrcmpiA(name, "CONTROL") == 0) return VK_CONTROL;
+    if (lstrcmpiA(name, "ALT") == 0) return VK_MENU;
+    if (lstrcmpiA(name, "CAPSLOCK") == 0) return VK_CAPITAL;
+    if (lstrcmpiA(name, "BACKSPACE") == 0) return VK_BACK;
+    return 0;
+}
 
 static void ReloadConfig(LONGLONG now)
 {
@@ -336,6 +377,15 @@ static void ReloadConfig(LONGLONG now)
     g_cfg.deadzone = ClampInt((int)GetPrivateProfileIntA("aim", "stick_deadzone", 15, g_iniPath), 0, 60);
     g_cfg.aimResponse = ClampInt((int)GetPrivateProfileIntA("aim", "aim_response_percent", 70, g_iniPath), 25, 150);
     g_cfg.switchStick = ClampInt((int)GetPrivateProfileIntA("aim", "target_switch_stick", 2, g_iniPath), 0, 2);
+    {
+        char keyName[32];
+        GetPrivateProfileStringA("aim", "aim_key", "O", keyName, sizeof(keyName), g_iniPath);
+        {
+            int key = ParseAimKey(keyName);
+            if (key)
+                g_cfg.aimKey = key;
+        }
+    }
     g_aimHeight = (float)ClampInt((int)GetPrivateProfileIntA("aim", "aim_height_cm", 95, g_iniPath), 40, 180) / 100.0f;
 }
 
@@ -423,7 +473,7 @@ static int TriggerHeld(void)
 
 static int AimButtonHeld(void)
 {
-    return TriggerHeld() || (GetAsyncKeyState('O') & 0x8000) != 0;
+    return TriggerHeld() || (GetAsyncKeyState(g_cfg.aimKey) & 0x8000) != 0;
 }
 
 /* One-shot flick of the chosen stick sideways: -1 left, +1 right, 0 none. Re-arms when the stick returns. */
