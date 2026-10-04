@@ -28,6 +28,9 @@
 #define MAX_ENTITIES        512u
 #define MAX_TARGET_DISTANCE 80.0f
 #define MIN_FORWARD_DOT     0.985f /* cos(10 degrees) */
+#define SWITCH_MIN_FORWARD_DOT 0.5f /* switching may reach people up to 60 degrees off the crosshair */
+#define SWITCH_MAX_ANGLE    1.2f    /* radians from the current target */
+#define SWITCH_MIN_DELTA    0.03f
 static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough to hit a crouching target */
 #define MIN_STEP_MS         5
 #define DEADZONE_RAD        0.004f
@@ -258,6 +261,40 @@ static uintptr_t FindNearestPed(uintptr_t world, uintptr_t player, Vector3 camer
     return nearest;
 }
 
+/* The person closest in bearing to `current` on one side of it (side +1 = right, -1 = left). */
+static uintptr_t FindAdjacentPed(uintptr_t world, uintptr_t player, Vector3 cameraPosition,
+                                 Vector3 cameraForward, uintptr_t current, int side)
+{
+    uintptr_t begin, count, i, found = 0;
+    Vector3 currentPosition, direction;
+    float currentBearing, bestDelta = SWITCH_MAX_ANGLE;
+    if (!ListBounds(world, &begin, &count) || !IsLivePed(current, &currentPosition))
+        return 0;
+    currentPosition.y += g_aimHeight;
+    direction = Subtract(currentPosition, cameraPosition);
+    currentBearing = atan2f(direction.x, direction.z);
+    for (i = 0; i < count; ++i)
+    {
+        uintptr_t object = ReadU32(begin + i * 4u);
+        Vector3 position;
+        float distanceSquared, delta;
+        if (object == player || object == current || !IsLivePed(object, &position))
+            continue;
+        position.y += g_aimHeight;
+        direction = Subtract(position, cameraPosition);
+        distanceSquared = Dot(direction, direction);
+        if (distanceSquared < 0.25f || distanceSquared > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE ||
+            !Normalize(&direction) || Dot(direction, cameraForward) < SWITCH_MIN_FORWARD_DOT)
+            continue;
+        delta = WrapAngle(atan2f(direction.x, direction.z) - currentBearing) * (float)side;
+        if (delta < SWITCH_MIN_DELTA || delta >= bestDelta)
+            continue;
+        bestDelta = delta;
+        found = object;
+    }
+    return found;
+}
+
 /* ---- settings (MafiaAimAssist.ini beside Game.exe, re-read every second) -- */
 
 typedef struct Config
@@ -268,9 +305,10 @@ typedef struct Config
     int invertY;
     int deadzone;    /* percent of stick travel */
     int aimResponse; /* percentage scaling the lock-on controller */
+    int switchStick; /* stick whose flick changes the locked target: 0 off, 1 left, 2 right */
 } Config;
 
-static Config g_cfg = {1, 1100, 1000, 0, 15, 70};
+static Config g_cfg = {1, 1100, 1000, 0, 15, 70, 2};
 static char g_iniPath[MAX_PATH];
 static LONGLONG g_configNext;
 
@@ -297,6 +335,7 @@ static void ReloadConfig(LONGLONG now)
     g_cfg.invertY = GetPrivateProfileIntA("aim", "invert_y", 0, g_iniPath) != 0;
     g_cfg.deadzone = ClampInt((int)GetPrivateProfileIntA("aim", "stick_deadzone", 15, g_iniPath), 0, 60);
     g_cfg.aimResponse = ClampInt((int)GetPrivateProfileIntA("aim", "aim_response_percent", 70, g_iniPath), 25, 150);
+    g_cfg.switchStick = ClampInt((int)GetPrivateProfileIntA("aim", "target_switch_stick", 2, g_iniPath), 0, 2);
     g_aimHeight = (float)ClampInt((int)GetPrivateProfileIntA("aim", "aim_height_cm", 95, g_iniPath), 40, 180) / 100.0f;
 }
 
@@ -385,6 +424,24 @@ static int TriggerHeld(void)
 static int AimButtonHeld(void)
 {
     return TriggerHeld() || (GetAsyncKeyState('O') & 0x8000) != 0;
+}
+
+/* One-shot flick of the chosen stick sideways: -1 left, +1 right, 0 none. Re-arms when the stick returns. */
+static int StickFlick(void)
+{
+    static int armed = 1;
+    float x;
+    if (!g_padOk || g_cfg.switchStick == 0)
+        return 0;
+    x = (float)(g_cfg.switchStick == 1 ? g_pad.gamepad.thumbLX : g_pad.gamepad.thumbRX) / 32767.0f;
+    if (fabsf(x) < 0.3f)
+        armed = 1;
+    else if (armed && fabsf(x) > 0.7f)
+    {
+        armed = 0;
+        return x > 0.0f ? 1 : -1;
+    }
+    return 0;
 }
 
 /* Right stick drives the mouse axes: radial deadzone, squared response, counts per second. */
@@ -524,6 +581,7 @@ static float     g_K = K_INIT, g_prevError = -1.0f, g_remX, g_remY;
 static int       g_growSteps, g_slowSteps, g_floorHits, g_logSteps, g_stallX, g_stallY, g_stepsSinceRetry;
 static LONG      g_lastAssistX, g_lastAssistY;
 static LONGLONG  g_noTargetLogAt;
+static int       g_switchSide;
 
 static void ReleaseAim(void)
 {
@@ -536,6 +594,7 @@ static void ReleaseAim(void)
     }
     g_held = 0;
     g_target = 0;
+    g_switchSide = 0;
     g_prevError = -1.0f;
     g_K = K_INIT;
     g_growSteps = g_slowSteps = g_floorHits = g_logSteps = 0;
@@ -565,6 +624,7 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
         g_stallX = g_stallY = 0;
         if (!g_target)
         {
+            g_switchSide = 0;
             if (now > g_noTargetLogAt)
             {
                 Log("no target in view");
@@ -574,6 +634,24 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
         }
         Log("target 0x%08lX at %.1f %.1f %.1f", (unsigned long)g_target, targetPosition.x,
             targetPosition.y, targetPosition.z);
+    }
+
+    if (g_switchSide)
+    {
+        uintptr_t next = FindAdjacentPed(world, player, cameraPosition, cameraForward, g_target, g_switchSide);
+        g_switchSide = 0;
+        if (next && IsLivePed(next, &targetPosition))
+        {
+            g_target = next;
+            g_prevError = -1.0f;
+            g_stallX = g_stallY = 0;
+            g_logSteps = 0;
+            Log("switched to target 0x%08lX", (unsigned long)g_target);
+        }
+        else
+        {
+            Log("no other person on that side");
+        }
     }
 
     targetPosition.y += g_aimHeight;
@@ -694,7 +772,7 @@ static void HandleMouse(LONG *lx, LONG *ly)
 
     ReloadConfig(now);
     PollPad(now);
-    if (g_cfg.stickLook && g_padOk)
+    if (g_cfg.stickLook && g_padOk && !(g_cfg.switchStick == 2 && g_target))
         AddStickLook(lx, ly, dt);
 
     held = AimButtonHeld();
@@ -704,6 +782,15 @@ static void HandleMouse(LONG *lx, LONG *ly)
     {
         g_held = 1;
         Log("press: gain=%.6f,%.6f", g_axis[0].gain, g_axis[1].gain);
+    }
+    if (held)
+    {
+        int flick = StickFlick();
+        if (flick)
+        {
+            g_switchSide = flick;
+            Log("stick flick %s", flick > 0 ? "right" : "left");
+        }
     }
 
     if (!GetWorld(&world, &player) || !ReadCamera(&cameraPosition, &cameraForward))

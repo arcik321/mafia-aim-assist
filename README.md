@@ -92,6 +92,7 @@ logs listed under [Troubleshooting](#troubleshooting).
 | --- | --- | --- |
 | `aim_height_cm` | `95` | Aim point above the target's feet. The default hits the torso of a standing person and the chest of a crouching one. Use about `120` to aim at the head of standing targets. |
 | `aim_response_percent` | `70` | Lock-on strength. Lower it for a slower approach; accepted range is `25` to `150`. Changes are read while the game runs. |
+| `target_switch_stick` | `2` | While locked on, flick this stick sideways to switch to the nearest person on that side: `2` right stick (it does not look around while a target is locked), `1` left stick (also moves the character), `0` off. |
 | `right_stick_look` | `1` | Right stick moves the camera. Set `0` to disable. |
 | `look_x_speed`, `look_y_speed` | `1100`, `1000` | Camera speed at full deflection, mouse counts per second. |
 | `invert_y` | `0` | `1` inverts the vertical look direction. |
