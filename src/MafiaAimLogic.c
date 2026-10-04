@@ -27,7 +27,7 @@
 
 #define MAX_ENTITIES        512u
 #define MAX_TARGET_DISTANCE 80.0f
-#define MIN_FORWARD_DOT     0.64f
+#define MIN_FORWARD_DOT     0.985f /* cos(10 degrees) */
 static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough to hit a crouching target */
 #define MIN_STEP_MS         5
 #define DEADZONE_RAD        0.004f
@@ -35,8 +35,8 @@ static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough t
 #define K_INIT              0.18f
 #define K_MIN               0.06f
 #define K_MAX               0.24f
-#define AIM_BRAKE_ANGLE     0.12f
-#define AIM_BRAKE_FLOOR     0.25f
+#define AIM_BRAKE_ANGLE     0.07f
+#define AIM_BRAKE_FLOOR     0.55f
 #define PI_F                3.14159265f
 
 /* Mouse sensitivity measured on this game: radians of camera turn per mouse count. */
