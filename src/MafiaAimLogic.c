@@ -31,10 +31,12 @@
 static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough to hit a crouching target */
 #define MIN_STEP_MS         5
 #define DEADZONE_RAD        0.004f
-#define MAX_STEP_COUNTS     120
-#define K_INIT              0.45f
-#define K_MIN               0.12f
-#define K_MAX               0.90f
+#define MAX_STEP_COUNTS     40
+#define K_INIT              0.18f
+#define K_MIN               0.06f
+#define K_MAX               0.24f
+#define AIM_BRAKE_ANGLE     0.12f
+#define AIM_BRAKE_FLOOR     0.25f
 #define PI_F                3.14159265f
 
 /* Mouse sensitivity measured on this game: radians of camera turn per mouse count. */
@@ -265,9 +267,10 @@ typedef struct Config
     int ySpeed;
     int invertY;
     int deadzone;    /* percent of stick travel */
+    int aimResponse; /* percentage scaling the lock-on controller */
 } Config;
 
-static Config g_cfg = {1, 1100, 1000, 0, 15};
+static Config g_cfg = {1, 1100, 1000, 0, 15, 70};
 static char g_iniPath[MAX_PATH];
 static LONGLONG g_configNext;
 
@@ -293,6 +296,7 @@ static void ReloadConfig(LONGLONG now)
     g_cfg.ySpeed = ClampInt((int)GetPrivateProfileIntA("aim", "look_y_speed", 1000, g_iniPath), 100, 6000);
     g_cfg.invertY = GetPrivateProfileIntA("aim", "invert_y", 0, g_iniPath) != 0;
     g_cfg.deadzone = ClampInt((int)GetPrivateProfileIntA("aim", "stick_deadzone", 15, g_iniPath), 0, 60);
+    g_cfg.aimResponse = ClampInt((int)GetPrivateProfileIntA("aim", "aim_response_percent", 70, g_iniPath), 25, 150);
     g_aimHeight = (float)ClampInt((int)GetPrivateProfileIntA("aim", "aim_height_cm", 95, g_iniPath), 40, 180) / 100.0f;
 }
 
@@ -545,7 +549,7 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
                    LONGLONG now)
 {
     Vector3 targetPosition, direction;
-    float errYaw, errPitch, error, cx, cy;
+    float errYaw, errPitch, error, cx, cy, brakeX, brakeY;
     int blockX, blockY;
     LONG ix = 0, iy = 0;
     LONG prevAssistX = g_lastAssistX, prevAssistY = g_lastAssistY;
@@ -578,6 +582,12 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
         return;
     errYaw = WrapAngle(atan2f(direction.x, direction.z) - yaw);
     errPitch = asinf(ClampUnit(direction.y)) - pitch;
+    brakeX = fabsf(errYaw) / AIM_BRAKE_ANGLE;
+    brakeY = fabsf(errPitch) / AIM_BRAKE_ANGLE;
+    if (brakeX < AIM_BRAKE_FLOOR) brakeX = AIM_BRAKE_FLOOR;
+    if (brakeY < AIM_BRAKE_FLOOR) brakeY = AIM_BRAKE_FLOOR;
+    if (brakeX > 1.0f) brakeX = 1.0f;
+    if (brakeY > 1.0f) brakeY = 1.0f;
 
     /* An axis that does not move although we push it is at a hard limit: stop pushing it. */
     if (labs(prevAssistX) >= 40 && fabsf(turnYaw) < 0.0006f) ++g_stallX; else g_stallX = 0;
@@ -637,8 +647,10 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
         return;
     }
 
-    cx = blockX ? 0.0f : g_K * errYaw / (float)g_axis[0].gain + g_remX;
-    cy = blockY ? 0.0f : g_K * errPitch / (float)g_axis[1].gain + g_remY;
+    cx = blockX ? 0.0f : brakeX * g_K * (float)g_cfg.aimResponse * 0.01f *
+        errYaw / (float)g_axis[0].gain + g_remX;
+    cy = blockY ? 0.0f : brakeY * g_K * (float)g_cfg.aimResponse * 0.01f *
+        errPitch / (float)g_axis[1].gain + g_remY;
     ix = (LONG)floorf(cx + 0.5f);
     iy = (LONG)floorf(cy + 0.5f);
     g_remX = cx - (float)ix;
