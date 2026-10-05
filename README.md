@@ -93,6 +93,9 @@ logs listed under [Troubleshooting](#troubleshooting).
 | `aim_height_cm` | `95` | Aim point above the target's feet. The default hits the torso of a standing person and the chest of a crouching one. Use about `120` to aim at the head of standing targets. |
 | `aim_key` | `O` | Keyboard key for lock-on. Set one letter/digit, `F1`-`F12`, `SPACE`, `ENTER`, `TAB`, `ESC`, `SHIFT`, `CTRL`, `ALT`, `CAPSLOCK` or `BACKSPACE`. The left trigger remains enabled. |
 | `aim_response_percent` | `70` | Lock-on strength. Lower it for a slower approach; accepted range is `25` to `150`. Changes are read while the game runs. |
+| `require_line_of_sight` | `1` | Requires clear geometry visibility for lock-on target selection. Set `0` to keep the old behaviour (front-cone targeting without wall blocking). |
+| `line_test_auto_scan` | `1` | Tries to auto-discover the game's line-test thunk and collision singleton in your `Game.exe` at runtime. Keep this on unless debugging. |
+| `line_test_horizontal_rva` | `0` | Optional manual override of `Game.exe` RVA of the horizontal line-test function/thunk (`collision_test_line_horizontal`). Leave `0` to use auto-scan first; set manually only if auto-scan fails. |
 | `target_switch_stick` | `2` | While locked on, flick this stick sideways to switch to the nearest person on that side: `2` right stick (it does not look around while a target is locked), `1` left stick (also moves the character), `0` off. |
 | `right_stick_look` | `1` | Right stick moves the camera. Set `0` to disable. |
 | `look_x_speed`, `look_y_speed` | `1100`, `1000` | Camera speed at full deflection, mouse counts per second. |
@@ -107,6 +110,9 @@ logs listed under [Troubleshooting](#troubleshooting).
   and confirm the Xidi files are installed. Without Steam Input, Windows exposes the controller to the game directly.
 - **Camera spins or aim drifts the wrong way:** delete `%TEMP%\MafiaAimGain.cal` and try again; the mod relearns
   your mouse sensitivity in a few seconds of play.
+- **Lock-on still grabs people behind walls:** keep `require_line_of_sight = 1` and set a valid
+  `line_test_auto_scan = 1`. Then check `%TEMP%\MafiaAimLogic.log` for `LOS auto-scan found...` lines.
+  If auto-scan does not bind LOS, set `line_test_horizontal_rva` manually.
 - **Logs:** `%TEMP%\MafiaAimLogic.log` and `%TEMP%\MafiaAimHost.log`. On SteamOS they are in the Proton prefix
   (`.../compatdata/<appid>/pfx/drive_c/users/steamuser/Temp/`).
 
@@ -120,8 +126,8 @@ release, both version 1.3. Older retail builds are not supported.
 
 - It locks onto the nearest living pedestrian in front of the camera. It does not know friend from foe, so it may
   pick a civilian.
-- It does not currently test line of sight. A pedestrian behind a wall can still be selected; reliable wall blocking
-  needs a game collision/raycast query that has not yet been identified for this build.
+- Reliable wall blocking depends on successful LOS binding (auto-scan or manual RVA). If binding fails,
+  line-of-sight filtering falls back to the old behaviour.
 - Disabled while driving.
 - It replaces `dinput8.dll`, so it cannot be combined with other mods that use the same file name.
 

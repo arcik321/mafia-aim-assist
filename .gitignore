@@ -4,3 +4,5 @@ dist/
 *.exp
 *.lib
 *.pdb
+_githubtoken.txt
+mafia-reverse-engineering-export/

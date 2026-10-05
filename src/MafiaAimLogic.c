@@ -47,6 +47,10 @@ static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough t
 #define SEED_GAIN_Y  -0.001105
 
 typedef struct Vector3 { float x, y, z; } Vector3;
+typedef void *(__fastcall *CollisionLineTestFn)(void *collisionSystem, void *unusedEdx,
+                                                const Vector3 *from, const Vector3 *to,
+                                                Vector3 *hitPosition, Vector3 *hitNormal,
+                                                int ignoreObject, uint32_t layerMask);
 
 static HANDLE g_log = INVALID_HANDLE_VALUE;
 static LONG   g_logLines;
@@ -131,6 +135,21 @@ static int ReadVector(uintptr_t address, Vector3 *out)
     return IsFinite(out->x) && IsFinite(out->y) && IsFinite(out->z);
 }
 
+static int IsExecutableAddress(const void *address)
+{
+    MEMORY_BASIC_INFORMATION info;
+    DWORD protection;
+    if (!address)
+        return 0;
+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT)
+        return 0;
+    if (info.Protect & PAGE_GUARD)
+        return 0;
+    protection = info.Protect & 0xFFu;
+    return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+           protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+}
+
 /* ---- vector helpers ---------------------------------------------------- */
 
 static float Dot(Vector3 a, Vector3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
@@ -139,6 +158,12 @@ static Vector3 Subtract(Vector3 a, Vector3 b)
 {
     Vector3 r = {a.x - b.x, a.y - b.y, a.z - b.z};
     return r;
+}
+
+static float DistanceSquared(Vector3 a, Vector3 b)
+{
+    Vector3 d = Subtract(a, b);
+    return Dot(d, d);
 }
 
 static int Normalize(Vector3 *v)
@@ -160,6 +185,7 @@ static float WrapAngle(float angle)
 }
 
 static float ClampUnit(float v) { return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v); }
+static int HasLineOfSight(Vector3 cameraPosition, Vector3 targetPosition);
 
 /* ---- game state -------------------------------------------------------- */
 
@@ -252,6 +278,8 @@ static uintptr_t FindNearestPed(uintptr_t world, uintptr_t player, Vector3 camer
             continue;
         if (Dot(direction, cameraForward) < MIN_FORWARD_DOT)
             continue;
+        if (!HasLineOfSight(cameraPosition, position))
+            continue;
         best = distanceSquared;
         nearest = object;
         *targetPosition = position;
@@ -286,6 +314,8 @@ static uintptr_t FindAdjacentPed(uintptr_t world, uintptr_t player, Vector3 came
         if (distanceSquared < 0.25f || distanceSquared > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE ||
             !Normalize(&direction) || Dot(direction, cameraForward) < SWITCH_MIN_FORWARD_DOT)
             continue;
+        if (!HasLineOfSight(cameraPosition, position))
+            continue;
         delta = WrapAngle(atan2f(direction.x, direction.z) - currentBearing) * (float)side;
         if (delta < SWITCH_MIN_DELTA || delta >= bestDelta)
             continue;
@@ -307,13 +337,33 @@ typedef struct Config
     int aimResponse; /* percentage scaling the lock-on controller */
     int switchStick; /* stick whose flick changes the locked target: 0 off, 1 left, 2 right */
     int aimKey;      /* keyboard virtual key used for lock-on */
+    int requireLos;  /* 1 = skip targets behind blocking geometry */
+    int autoScanLos; /* 1 = try to auto-discover LOS RVA and singleton */
+    uint32_t losRva; /* Game.exe RVA of collision_test_line_horizontal */
 } Config;
 
-static Config g_cfg = {1, 1100, 1000, 0, 15, 70, 2, 'O'};
+static Config g_cfg = {1, 1100, 1000, 0, 15, 70, 2, 'O', 1, 1, 0};
 static char g_iniPath[MAX_PATH];
 static LONGLONG g_configNext;
+static CollisionLineTestFn g_lineTest;
+static void *g_collisionSingleton;
+static int g_losBindState;
 
 static int ClampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+static uint32_t ParseHexOrDecU32(const char *value, uint32_t fallback)
+{
+    char *end;
+    unsigned long parsed;
+    if (!value || !value[0])
+        return fallback;
+    parsed = strtoul(value, &end, 0);
+    while (*end == ' ' || *end == '\t')
+        ++end;
+    if (*end != '\0')
+        return fallback;
+    return (uint32_t)parsed;
+}
 
 static int ParseAimKey(const char *name)
 {
@@ -355,8 +405,232 @@ static int ParseAimKey(const char *name)
     return 0;
 }
 
+static int GetTextSection(uint8_t **begin, uint8_t **end, uintptr_t *moduleBase)
+{
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_SECTION_HEADER *section;
+    unsigned i;
+    if (!base || !IsReadable((const void *)base, sizeof(IMAGE_DOS_HEADER)) || dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    nt = (IMAGE_NT_HEADERS *)(base + (uintptr_t)dos->e_lfanew);
+    if (!IsReadable(nt, sizeof(IMAGE_NT_HEADERS)) || nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    section = IMAGE_FIRST_SECTION(nt);
+    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        uint32_t size = section[i].Misc.VirtualSize ? section[i].Misc.VirtualSize : section[i].SizeOfRawData;
+        if (size >= 0x1000 && (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+        {
+            *begin = (uint8_t *)(base + section[i].VirtualAddress);
+            *end = *begin + size;
+            *moduleBase = base;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t Rel32Target(const uint8_t *op)
+{
+    int32_t rel = *(const int32_t *)(op + 1);
+    return (uintptr_t)(op + 5) + (uintptr_t)rel;
+}
+
+static int FindLineTestThunkRvaAuto(uint32_t *rvaOut)
+{
+    uint8_t *textBegin, *textEnd, *p;
+    uintptr_t base;
+    if (!GetTextSection(&textBegin, &textEnd, &base))
+        return 0;
+    for (p = textBegin; p + 0x40 < textEnd; ++p)
+    {
+        uintptr_t t0, t1, t2, t3;
+        if (p[0] != 0xE9 || p[0x10] != 0xE9 || p[0x20] != 0xE9 || p[0x30] != 0xE9)
+            continue;
+        t0 = Rel32Target(p);
+        t1 = Rel32Target(p + 0x10);
+        t2 = Rel32Target(p + 0x20);
+        t3 = Rel32Target(p + 0x30);
+        if (t0 < (uintptr_t)textBegin || t0 >= (uintptr_t)textEnd ||
+            t1 < (uintptr_t)textBegin || t1 >= (uintptr_t)textEnd ||
+            t2 < (uintptr_t)textBegin || t2 >= (uintptr_t)textEnd ||
+            t3 < (uintptr_t)textBegin || t3 >= (uintptr_t)textEnd)
+            continue;
+        if (*(uint8_t *)t2 == 0xE9 || !IsExecutableAddress((const void *)t2))
+            continue;
+        *rvaOut = (uint32_t)((uintptr_t)(p + 0x20) - base);
+        return 1;
+    }
+    return 0;
+}
+
+static int FindCollisionSingletonByCallers(uint32_t lineTestRva, uintptr_t *singletonOut)
+{
+    uint8_t *textBegin, *textEnd, *p;
+    uintptr_t base, target;
+    uintptr_t values[32];
+    int counts[32];
+    int used = 0, i, best = -1, bestCount = 0;
+    if (!GetTextSection(&textBegin, &textEnd, &base))
+        return 0;
+    target = base + lineTestRva;
+    memset(values, 0, sizeof(values));
+    memset(counts, 0, sizeof(counts));
+    for (p = textBegin + 5; p + 5 < textEnd; ++p)
+    {
+        uintptr_t callTarget;
+        uint32_t imm;
+        if (p[0] != 0xE8)
+            continue;
+        callTarget = Rel32Target(p);
+        if (callTarget != target)
+            continue;
+        if (*(p - 5) != 0xB9)
+            continue;
+        imm = *(uint32_t *)(p - 4);
+        for (i = 0; i < used; ++i)
+            if (values[i] == (uintptr_t)imm)
+                break;
+        if (i == used)
+        {
+            if (used >= 32)
+                continue;
+            values[used] = (uintptr_t)imm;
+            counts[used] = 0;
+            ++used;
+        }
+        ++counts[i];
+        if (counts[i] > bestCount)
+        {
+            bestCount = counts[i];
+            best = i;
+        }
+    }
+    if (best < 0 || bestCount < 2)
+        return 0;
+    *singletonOut = values[best];
+    return 1;
+}
+
+static int ResolveLineTest(void)
+{
+    uintptr_t base, address;
+    Vector3 a, b;
+    if (!g_cfg.requireLos)
+        return 0;
+    if (g_lineTest && g_collisionSingleton)
+        return 1;
+    if (g_cfg.losRva == 0 && g_cfg.autoScanLos)
+    {
+        uint32_t detectedRva;
+        if (FindLineTestThunkRvaAuto(&detectedRva))
+        {
+            g_cfg.losRva = detectedRva;
+            Log("LOS auto-scan found line-test thunk RVA 0x%08lX", (unsigned long)g_cfg.losRva);
+        }
+    }
+    if (g_cfg.losRva == 0)
+    {
+        if (!g_losBindState)
+        {
+            Log("LOS unresolved: set line_test_horizontal_rva or keep line_test_auto_scan=1");
+            g_losBindState = -1;
+        }
+        return 0;
+    }
+    base = (uintptr_t)GetModuleHandleA(NULL);
+    address = base + (uintptr_t)g_cfg.losRva;
+    if (!IsExecutableAddress((const void *)address))
+    {
+        if (g_losBindState != -2)
+        {
+            Log("LOS RVA 0x%08lX is not executable in this build", (unsigned long)g_cfg.losRva);
+            g_losBindState = -2;
+        }
+        return 0;
+    }
+    g_lineTest = (CollisionLineTestFn)address;
+
+    if (!g_collisionSingleton && g_cfg.autoScanLos)
+    {
+        uintptr_t singleton;
+        if (FindCollisionSingletonByCallers(g_cfg.losRva, &singleton))
+        {
+            g_collisionSingleton = (void *)singleton;
+            Log("LOS auto-scan found collision singleton at 0x%08lX", (unsigned long)singleton);
+        }
+    }
+    if (!g_collisionSingleton)
+    {
+        if (g_losBindState != -4)
+        {
+            Log("LOS thunk found at RVA 0x%08lX but collision singleton is unknown", (unsigned long)g_cfg.losRva);
+            g_losBindState = -4;
+        }
+        return 0;
+    }
+
+    a.x = a.y = a.z = 0.0f;
+    b.x = 0.0f; b.y = 0.0f; b.z = 1.0f;
+    __try
+    {
+        (void)g_lineTest(g_collisionSingleton, NULL, &a, &b, NULL, NULL, -1, 0x00348D02u);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_lineTest = NULL;
+        g_collisionSingleton = NULL;
+        if (g_losBindState != -5)
+        {
+            Log("LOS probe call failed for RVA 0x%08lX", (unsigned long)g_cfg.losRva);
+            g_losBindState = -5;
+        }
+        return 0;
+    }
+
+    g_losBindState = 1;
+    Log("LOS line test bound at RVA 0x%08lX (singleton 0x%08lX)",
+        (unsigned long)g_cfg.losRva, (unsigned long)(uintptr_t)g_collisionSingleton);
+    return 1;
+}
+
+static int HasLineOfSight(Vector3 cameraPosition, Vector3 targetPosition)
+{
+    void *hit;
+    Vector3 hitPosition, hitNormal;
+    float targetDistanceSquared, hitDistanceSquared;
+    if (!g_cfg.requireLos)
+        return 1;
+    if (!ResolveLineTest())
+        return 1; /* fail-open until a valid RVA is provided */
+    __try
+    {
+        hit = g_lineTest(g_collisionSingleton, NULL, &cameraPosition, &targetPosition,
+                 &hitPosition, &hitNormal, -1, 0x00348D02u);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_lineTest = NULL;
+        g_losBindState = -3;
+        Log("LOS call crashed; disabled until next config reload");
+        return 1;
+    }
+    if (!hit)
+        return 1;
+    if (!IsFinite(hitPosition.x) || !IsFinite(hitPosition.y) || !IsFinite(hitPosition.z))
+        return 0;
+    targetDistanceSquared = DistanceSquared(targetPosition, cameraPosition);
+    hitDistanceSquared = DistanceSquared(hitPosition, cameraPosition);
+    return hitDistanceSquared + 0.36f >= targetDistanceSquared;
+}
+
 static void ReloadConfig(LONGLONG now)
 {
+    uint32_t previousLosRva = g_cfg.losRva;
+    int previousRequireLos = g_cfg.requireLos;
+    int previousAutoScanLos = g_cfg.autoScanLos;
     if (now < g_configNext)
         return;
     g_configNext = now + 1000;
@@ -377,6 +651,13 @@ static void ReloadConfig(LONGLONG now)
     g_cfg.deadzone = ClampInt((int)GetPrivateProfileIntA("aim", "stick_deadzone", 15, g_iniPath), 0, 60);
     g_cfg.aimResponse = ClampInt((int)GetPrivateProfileIntA("aim", "aim_response_percent", 70, g_iniPath), 25, 150);
     g_cfg.switchStick = ClampInt((int)GetPrivateProfileIntA("aim", "target_switch_stick", 2, g_iniPath), 0, 2);
+    g_cfg.requireLos = GetPrivateProfileIntA("aim", "require_line_of_sight", 1, g_iniPath) != 0;
+    g_cfg.autoScanLos = GetPrivateProfileIntA("aim", "line_test_auto_scan", 1, g_iniPath) != 0;
+    {
+        char rva[48];
+        GetPrivateProfileStringA("aim", "line_test_horizontal_rva", "", rva, sizeof(rva), g_iniPath);
+        g_cfg.losRva = rva[0] ? ParseHexOrDecU32(rva, 0u) : 0u;
+    }
     {
         char keyName[32];
         GetPrivateProfileStringA("aim", "aim_key", "O", keyName, sizeof(keyName), g_iniPath);
@@ -387,6 +668,13 @@ static void ReloadConfig(LONGLONG now)
         }
     }
     g_aimHeight = (float)ClampInt((int)GetPrivateProfileIntA("aim", "aim_height_cm", 95, g_iniPath), 40, 180) / 100.0f;
+    if (g_cfg.losRva != previousLosRva || g_cfg.requireLos != previousRequireLos ||
+        g_cfg.autoScanLos != previousAutoScanLos)
+    {
+        g_lineTest = NULL;
+        g_collisionSingleton = NULL;
+        g_losBindState = 0;
+    }
 }
 
 /* ---- controller (XInput) ------------------------------------------------- */
@@ -705,6 +993,13 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
     }
 
     targetPosition.y += g_aimHeight;
+    if (!HasLineOfSight(cameraPosition, targetPosition))
+    {
+        g_target = 0;
+        g_prevError = -1.0f;
+        g_stallX = g_stallY = 0;
+        return;
+    }
     direction = Subtract(targetPosition, cameraPosition);
     if (!Normalize(&direction))
         return;
