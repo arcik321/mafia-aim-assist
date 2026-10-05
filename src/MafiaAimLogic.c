@@ -52,7 +52,6 @@
 #define SWITCH_MIN_DELTA    0.03f
 #define STICK_FLICK_DOMINANCE 1.3f
 #define TARGET_SWITCH_COOLDOWN_MS 350
-#define ENEMY_RECHECK_INTERVAL_MS 250
 static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough to hit a crouching target */
 static int   g_aimZone;
 #define MIN_STEP_MS         5
@@ -65,7 +64,6 @@ static int   g_aimZone;
 #define AIM_BRAKE_FLOOR     0.55f
 #define LOS_CHECK_INTERVAL_MS 100
 #define LOS_BLOCKED_DROP_CHECKS 5
-#define LOS_REACQUIRE_DELAY_MS 500
 #define LOS_TARGET_MARGIN   0.6f
 #define PI_F                3.14159265f
 
@@ -89,6 +87,8 @@ typedef void (__fastcall *UpdateWorldMatrixFn)(void *frame, void *unused);
 
 static int g_losEnabled = 1;
 static int g_prioritizeEnemies = 1;
+static float g_targetConeDot = MIN_FORWARD_DOT;
+static float g_enemyTargetConeDot = ENEMY_PRIORITY_FORWARD_DOT;
 static int g_crouchAwareHeadAim = 1;
 static int g_animatedHeadAim = 1;
 static float g_animatedHeadForward = 0.08f;
@@ -495,7 +495,7 @@ static uintptr_t FindNearestPed(uintptr_t world, uintptr_t player, Vector3 camer
             !Normalize(&direction))
             continue;
         if (Dot(direction, cameraForward) <
-            (priorityEnemy ? ENEMY_PRIORITY_FORWARD_DOT : MIN_FORWARD_DOT))
+            (priorityEnemy ? g_enemyTargetConeDot : g_targetConeDot))
             continue;
         if (!HasLineOfSight(cameraPosition, aimPosition))
             continue;
@@ -571,35 +571,6 @@ static uintptr_t FindAdjacentPed(uintptr_t world, uintptr_t player, Vector3 came
         }
     }
     return foundEnemy ? foundEnemy : found;
-}
-
-static uintptr_t FindNearestPriorityEnemyPed(uintptr_t world, uintptr_t player,
-                                             Vector3 cameraPosition, Vector3 cameraForward,
-                                             Vector3 *targetPosition)
-{
-    uintptr_t begin, count, i, nearest = 0;
-    float best = MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE;
-    if (!g_prioritizeEnemies || !ListBounds(world, &begin, &count))
-        return 0;
-    for (i = 0; i < count; ++i)
-    {
-        uintptr_t object = ReadU32(begin + i * 4u);
-        Vector3 position, aimPosition, direction;
-        float distanceSquared;
-        if (object == player || !IsPriorityEnemyPed(object) || !IsLivePed(object, &position))
-            continue;
-        GetAimPointPosition(object, position, &aimPosition);
-        direction = Subtract(aimPosition, cameraPosition);
-        distanceSquared = Dot(direction, direction);
-        if (distanceSquared < 0.25f || distanceSquared > best || !Normalize(&direction) ||
-            Dot(direction, cameraForward) < ENEMY_PRIORITY_FORWARD_DOT ||
-            !HasLineOfSight(cameraPosition, aimPosition))
-            continue;
-        best = distanceSquared;
-        nearest = object;
-        *targetPosition = position;
-    }
-    return nearest;
 }
 
 /* ---- settings (MafiaAimAssist.ini beside Game.exe, re-read every second) -- */
@@ -685,6 +656,10 @@ static void ReloadConfig(LONGLONG now)
     g_cfg.aimResponse = ClampInt((int)GetPrivateProfileIntA("aim", "aim_response_percent", 70, g_iniPath), 25, 150);
     g_cfg.switchStick = ClampInt((int)GetPrivateProfileIntA("aim", "target_switch_stick", 2, g_iniPath), 0, 2);
     g_prioritizeEnemies = GetPrivateProfileIntA("aim", "prioritize_enemies", 1, g_iniPath) != 0;
+    g_targetConeDot = cosf((float)ClampInt((int)GetPrivateProfileIntA(
+        "aim", "target_cone_degrees", 20, g_iniPath), 5, 45) * PI_F / 180.0f);
+    g_enemyTargetConeDot = cosf((float)ClampInt((int)GetPrivateProfileIntA(
+        "aim", "enemy_target_cone_degrees", 35, g_iniPath), 5, 60) * PI_F / 180.0f);
     g_crouchAwareHeadAim = GetPrivateProfileIntA("aim", "experimental_crouch_head_aim", 1, g_iniPath) != 0;
     g_animatedHeadAim = GetPrivateProfileIntA("aim", "animated_head_aim", 1, g_iniPath) != 0;
     g_animatedHeadForward = (float)ClampInt((int)GetPrivateProfileIntA(
@@ -966,9 +941,8 @@ static LONGLONG  g_noTargetLogAt;
 static int       g_switchSide;
 static LONGLONG  g_nextLosCheck;
 static int       g_losBlockedChecks;
-static LONGLONG  g_nextEnemySearch;
 static LONGLONG  g_nextSwitchAt;
-static LONGLONG  g_reacquireAfter;
+static int       g_acquirePending;
 
 static void ReleaseAim(void)
 {
@@ -985,9 +959,8 @@ static void ReleaseAim(void)
     g_aimZone = 0;
     g_nextLosCheck = 0;
     g_losBlockedChecks = 0;
-    g_nextEnemySearch = 0;
     g_nextSwitchAt = 0;
-    g_reacquireAfter = 0;
+    g_acquirePending = 0;
     g_prevError = -1.0f;
     g_K = K_INIT;
     g_growSteps = g_slowSteps = g_floorHits = g_logSteps = 0;
@@ -1010,21 +983,27 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
     if (g_axis[0].gain == 0.0 || g_axis[1].gain == 0.0)
         return;
 
-    if (!g_target && now < g_reacquireAfter)
+    if (g_target && !TargetStillValid(world, player, g_target, &targetPosition))
     {
+        Log("target lost; release and press aim to acquire again");
+        g_target = 0;
+        g_acquirePending = 0;
         g_switchSide = 0;
+        g_prevError = -1.0f;
+        g_stallX = g_stallY = 0;
+        g_losBlockedChecks = 0;
         return;
     }
 
-    if (!g_target || !TargetStillValid(world, player, g_target, &targetPosition))
+    if (!g_target)
     {
+        if (!g_acquirePending)
+            return;
         g_target = FindNearestPed(world, player, cameraPosition, cameraForward, &targetPosition);
-        g_reacquireAfter = 0;
         g_prevError = -1.0f;
         g_stallX = g_stallY = 0;
         g_losBlockedChecks = 0;
         g_nextLosCheck = now;
-        g_nextEnemySearch = now + ENEMY_RECHECK_INTERVAL_MS;
         if (!g_target)
         {
             g_switchSide = 0;
@@ -1035,27 +1014,9 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
             }
             return;
         }
+        g_acquirePending = 0;
         Log("target 0x%08lX at %.1f %.1f %.1f enemy_priority=%d", (unsigned long)g_target,
             targetPosition.x, targetPosition.y, targetPosition.z, IsPriorityEnemyPed(g_target));
-    }
-
-    if (g_target && g_prioritizeEnemies && !IsPriorityEnemyPed(g_target) && now >= g_nextEnemySearch)
-    {
-        Vector3 enemyPosition;
-        uintptr_t enemy = FindNearestPriorityEnemyPed(world, player, cameraPosition, cameraForward,
-                                                      &enemyPosition);
-        g_nextEnemySearch = now + ENEMY_RECHECK_INTERVAL_MS;
-        if (enemy)
-        {
-            g_target = enemy;
-            targetPosition = enemyPosition;
-            g_prevError = -1.0f;
-            g_stallX = g_stallY = 0;
-            g_logSteps = 0;
-            g_losBlockedChecks = 0;
-            g_nextLosCheck = now;
-            Log("promoted to enemy target 0x%08lX", (unsigned long)g_target);
-        }
     }
 
     if (g_switchSide && now < g_nextSwitchAt)
@@ -1094,8 +1055,8 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
         {
             Log("target behind cover: dropped");
             g_target = 0;
+            g_acquirePending = 0;
             g_switchSide = 0;
-            g_reacquireAfter = now + LOS_REACQUIRE_DELAY_MS;
             g_prevError = -1.0f;
             g_stallX = g_stallY = 0;
             g_losBlockedChecks = 0;
@@ -1228,6 +1189,7 @@ static void HandleMouse(LONG *lx, LONG *ly)
     else if (!g_held)
     {
         g_held = 1;
+        g_acquirePending = 1;
         Log("press: gain=%.6f,%.6f", g_axis[0].gain, g_axis[1].gain);
     }
     if (held)

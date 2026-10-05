@@ -98,8 +98,10 @@ logs listed under [Troubleshooting](#troubleshooting).
 | `aim_key` | `O` | Keyboard key for lock-on. Set one letter/digit, `F1`-`F12`, `SPACE`, `ENTER`, `TAB`, `ESC`, `SHIFT`, `CTRL`, `ALT`, `CAPSLOCK` or `BACKSPACE`. The left trigger remains enabled. |
 | `aim_response_percent` | `70` | Lock-on strength. Lower it for a slower approach; accepted range is `25` to `150`. Changes are read while the game runs. |
 | `require_line_of_sight` | `1` | Require an unobstructed collision line to acquire or keep a target. Set `0` to disable. If the supported game function cannot be validated, the mod logs the issue and falls back to the previous targeting behavior. |
-| `prioritize_enemies` | `1` | Prefer scripted mission enemies (AI group 4) over other NPCs, including promoting an existing civilian lock when an enemy is visible. Enemies are searched within a wider 25-degree cone; civilians remain limited to 10 degrees. Falls back to another eligible person if no group-4 target is available; set `0` to disable. |
-| `target_switch_stick` | `2` | While locked on, make a horizontal-dominant flick to switch to the nearest person on that side. Vertical-dominant flicks are reserved for aim zones; switches have a short debounce. `2` right stick, `1` left stick, `0` off. |
+| `prioritize_enemies` | `1` | Prefer scripted mission enemies (AI group 4) when acquiring or manually switching. A locked target is not automatically replaced. Falls back to another eligible person if no group-4 target is available; set `0` to disable. |
+| `target_cone_degrees` | `20` | Acquisition cone for ordinary NPCs, in degrees (`5` to `45`). |
+| `enemy_target_cone_degrees` | `35` | Acquisition cone for mission enemies, in degrees (`5` to `60`). |
+| `target_switch_stick` | `2` | While locked on, make a horizontal-dominant flick to switch to the nearest person on that side. Vertical-dominant flicks are reserved for aim zones; switches have a short debounce. After losing a target, release and press the aim button again to acquire another. `2` right stick, `1` left stick, `0` off. |
 | `right_stick_look` | `1` | Right stick moves the camera. Set `0` to disable. |
 | `look_x_speed`, `look_y_speed` | `1100`, `1000` | Camera speed at full deflection, mouse counts per second. |
 | `invert_y` | `0` | `1` inverts the vertical look direction. |
