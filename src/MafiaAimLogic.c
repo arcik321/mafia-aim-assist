@@ -22,16 +22,39 @@
 #define WORLD_LIST_END_OFFSET    0xF4u
 #define ENTITY_POSITION_OFFSET   0x24u
 #define ENTITY_HEALTH_OFFSET     0x644u
+#define EXPERIMENTAL_STANCE_BYTE_OFFSET 0x1E4u
+#define SHOT_SKELETON_OFFSET     0x2DCu
+#define SHOT_SKELETON_SIZE       0x130u
+#define SHOT_SKELETON_JOINT_COUNT 16u
+#define SHOT_SKELETON_BONES_OFFSET 0x40u
+#define SHOT_SKELETON_BONE_COUNT 10u
+#define SHOT_SKELETON_BONE_STRIDE 0x18u
+#define SHOT_SKELETON_BODY_PART_OFFSET 0x14u
+#define SHOT_SKELETON_HEAD_PART  6u
+#define FRAME_WORLD_POSITION_OFFSET 0x40u
+#define FRAME_WORLD_FORWARD_OFFSET 0x30u
+#define FRAME_FLAGS_OFFSET       0xACu
+#define FRAME_WORLD_MATRIX_VALID 0x20u
+#define ENTITY_KIND_OFFSET       0x10u
+#define ENTITY_TYPE_GROUP_OFFSET 0xF4Cu
+#define SCRIPTABLE_NPC_KIND      0x1Bu
+#define MISSION_ENEMY_GROUP      4u
 #define CAMERA_FORWARD_OFFSET    0x30u
 #define CAMERA_POSITION_OFFSET   0x40u
+#define COLLISION_LINE_WRAPPER_RVA 0x1D5910u
 
 #define MAX_ENTITIES        512u
 #define MAX_TARGET_DISTANCE 80.0f
 #define MIN_FORWARD_DOT     0.985f /* cos(10 degrees) */
+#define ENEMY_PRIORITY_FORWARD_DOT 0.9063f /* cos(25 degrees) */
 #define SWITCH_MIN_FORWARD_DOT 0.5f /* switching may reach people up to 60 degrees off the crosshair */
 #define SWITCH_MAX_ANGLE    1.2f    /* radians from the current target */
 #define SWITCH_MIN_DELTA    0.03f
+#define STICK_FLICK_DOMINANCE 1.3f
+#define TARGET_SWITCH_COOLDOWN_MS 350
+#define ENEMY_RECHECK_INTERVAL_MS 250
 static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough to hit a crouching target */
+static int   g_aimZone;
 #define MIN_STEP_MS         5
 #define DEADZONE_RAD        0.004f
 #define MAX_STEP_COUNTS     40
@@ -40,13 +63,38 @@ static float g_aimHeight = 0.95f; /* metres above the ped's origin; low enough t
 #define K_MAX               0.24f
 #define AIM_BRAKE_ANGLE     0.07f
 #define AIM_BRAKE_FLOOR     0.55f
+#define LOS_CHECK_INTERVAL_MS 100
+#define LOS_BLOCKED_DROP_CHECKS 5
+#define LOS_REACQUIRE_DELAY_MS 500
+#define LOS_TARGET_MARGIN   0.6f
 #define PI_F                3.14159265f
+
+static float AimPointHeight(void)
+{
+    float height = g_aimHeight + (g_aimZone > 0 ? 0.75f : (g_aimZone < 0 ? -0.25f : 0.0f));
+    if (height < 0.4f) height = 0.4f;
+    if (height > 1.8f) height = 1.8f;
+    return height;
+}
 
 /* Mouse sensitivity measured on this game: radians of camera turn per mouse count. */
 #define SEED_GAIN_X   0.002039
 #define SEED_GAIN_Y  -0.001105
 
 typedef struct Vector3 { float x, y, z; } Vector3;
+typedef int (__stdcall *CollisionLineTestFn)(const Vector3 *from, const Vector3 *delta,
+                                             Vector3 *hitPosition, Vector3 *hitNormal,
+                                             int ignoreObject, uint32_t mask);
+typedef void (__fastcall *UpdateWorldMatrixFn)(void *frame, void *unused);
+
+static int g_losEnabled = 1;
+static int g_prioritizeEnemies = 1;
+static int g_crouchAwareHeadAim = 1;
+static int g_animatedHeadAim = 1;
+static float g_animatedHeadForward = 0.08f;
+static int g_lineTestState;
+static int g_lineTestLogCount;
+static CollisionLineTestFn g_lineTest;
 
 static HANDLE g_log = INVALID_HANDLE_VALUE;
 static LONG   g_logLines;
@@ -161,6 +209,66 @@ static float WrapAngle(float angle)
 
 static float ClampUnit(float v) { return v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v); }
 
+static int BindLineTest(void)
+{
+    static const unsigned char signature[10] = {
+        0xB9, 0x48, 0x7F, 0x64, 0x00, 0xE9, 0xF6, 0x11, 0xFF, 0xFF
+    };
+    uintptr_t base;
+    const void *address;
+    if (g_lineTestState != 0)
+        return g_lineTestState > 0;
+    base = (uintptr_t)GetModuleHandleA(NULL);
+    address = (const void *)(base + COLLISION_LINE_WRAPPER_RVA);
+    if (!base || !IsReadable(address, sizeof(signature)) ||
+        memcmp(address, signature, sizeof(signature)) != 0)
+    {
+        g_lineTestState = -1;
+        Log("LOS disabled: Game.exe line-test wrapper signature did not match");
+        return 0;
+    }
+    g_lineTest = (CollisionLineTestFn)address;
+    g_lineTestState = 1;
+    Log("LOS bound to Game.exe wrapper RVA 0x%08lX", (unsigned long)COLLISION_LINE_WRAPPER_RVA);
+    return 1;
+}
+
+static int HasLineOfSight(Vector3 from, Vector3 target)
+{
+    Vector3 delta = Subtract(target, from);
+    Vector3 hitPosition = {0.0f, 0.0f, 0.0f};
+    Vector3 hitNormal = {0.0f, 0.0f, 0.0f};
+    float lineDistance, hitDistance;
+    int hit, blocked;
+    if (!g_losEnabled || !BindLineTest())
+        return 1;
+    lineDistance = sqrtf(Dot(delta, delta));
+    if (!IsFinite(lineDistance) || lineDistance < 0.1f)
+        return 1;
+    __try
+    {
+        hit = g_lineTest(&from, &delta, &hitPosition, &hitNormal, -1, 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_lineTest = NULL;
+        g_lineTestState = -1;
+        Log("LOS call raised an exception; line-of-sight filtering disabled");
+        return 1;
+    }
+    if (!hit || !IsFinite(hitPosition.x) || !IsFinite(hitPosition.y) || !IsFinite(hitPosition.z))
+        return 1;
+    hitDistance = sqrtf(Dot(Subtract(hitPosition, from), Subtract(hitPosition, from)));
+    blocked = IsFinite(hitDistance) && hitDistance + LOS_TARGET_MARGIN < lineDistance;
+    if (g_lineTestLogCount < 40)
+    {
+        ++g_lineTestLogCount;
+        Log("LOS hit=%d distance=%.2f hit_distance=%.2f result=%s", hit, lineDistance,
+            hitDistance, blocked ? "blocked" : "clear");
+    }
+    return !blocked;
+}
+
 /* ---- game state -------------------------------------------------------- */
 
 static int GetWorld(uintptr_t *world, uintptr_t *player)
@@ -207,6 +315,136 @@ static int IsLivePed(uintptr_t object, Vector3 *position)
     return ReadVector(object + ENTITY_POSITION_OFFSET, position);
 }
 
+static int IsPriorityEnemyPed(uintptr_t object)
+{
+    if (!g_prioritizeEnemies || ReadU32(object + ENTITY_KIND_OFFSET) != SCRIPTABLE_NPC_KIND)
+        return 0;
+    return ReadU32(object + ENTITY_TYPE_GROUP_OFFSET) == MISSION_ENEMY_GROUP;
+}
+
+static uintptr_t g_stanceProbeTarget;
+static int g_stanceProbeValue = -1;
+
+static int ReadTargetStanceByte(uintptr_t target)
+{
+    if (!target || !IsReadable((const void *)(target + EXPERIMENTAL_STANCE_BYTE_OFFSET), 1))
+        return -1;
+    return *(volatile BYTE *)(target + EXPERIMENTAL_STANCE_BYTE_OFFSET);
+}
+
+static void ProbeStanceByte(uintptr_t target)
+{
+    int value = ReadTargetStanceByte(target);
+    uintptr_t kind, group;
+    if (!target)
+        return;
+    if (target == g_stanceProbeTarget && value == g_stanceProbeValue)
+        return;
+    kind = ReadU32(target + ENTITY_KIND_OFFSET);
+    group = ReadU32(target + ENTITY_TYPE_GROUP_OFFSET);
+    Log("stance_probe target=0x%08lX byte_1e4=%d kind=%lu group=%lu",
+        (unsigned long)target, value, (unsigned long)kind, (unsigned long)group);
+    g_stanceProbeTarget = target;
+    g_stanceProbeValue = value;
+}
+
+static float AimPointHeightForTarget(uintptr_t target)
+{
+    float height = AimPointHeight();
+    if (g_crouchAwareHeadAim && g_aimZone > 0 && ReadTargetStanceByte(target) > 0)
+        height = g_aimHeight + 0.30f;
+    if (height < 0.4f) height = 0.4f;
+    if (height > 1.8f) height = 1.8f;
+    return height;
+}
+
+static int ReadFrameWorldPosition(uintptr_t frame, Vector3 *position)
+{
+    static UpdateWorldMatrixFn updateWorldMatrix;
+    static int updateWorldMatrixChecked;
+    uintptr_t flagsAddress = frame + FRAME_FLAGS_OFFSET;
+    if (!frame || !IsReadable((const void *)flagsAddress, 4))
+        return 0;
+    if ((ReadU32(flagsAddress) & FRAME_WORLD_MATRIX_VALID) == 0)
+    {
+        if (!updateWorldMatrixChecked)
+        {
+            HMODULE ls3df = GetModuleHandleA("LS3DF.dll");
+            if (ls3df)
+                updateWorldMatrix = (UpdateWorldMatrixFn)GetProcAddress(
+                    ls3df, "?UpdateWMatrixProc@I3D_frame@@AAEXXZ");
+            updateWorldMatrixChecked = 1;
+        }
+        if (!updateWorldMatrix)
+            return 0;
+        updateWorldMatrix((void *)frame, NULL);
+        if ((ReadU32(flagsAddress) & FRAME_WORLD_MATRIX_VALID) == 0)
+            return 0;
+    }
+    return ReadVector(frame + FRAME_WORLD_POSITION_OFFSET, position);
+}
+
+static int ReadAnimatedHeadPoint(uintptr_t target, Vector3 *headPoint)
+{
+    uintptr_t skeleton = target + SHOT_SKELETON_OFFSET;
+    uintptr_t boneIndex;
+    if (!target || !IsReadable((const void *)skeleton, SHOT_SKELETON_SIZE))
+        return 0;
+    for (boneIndex = 0; boneIndex < SHOT_SKELETON_BONE_COUNT; ++boneIndex)
+    {
+        uintptr_t bone = skeleton + SHOT_SKELETON_BONES_OFFSET + boneIndex * SHOT_SKELETON_BONE_STRIDE;
+        uintptr_t jointAIndex, jointBIndex, jointAFrame, jointBFrame;
+        float start, end, along;
+        Vector3 jointA, jointB, axis;
+        if (ReadU32(bone + SHOT_SKELETON_BODY_PART_OFFSET) != SHOT_SKELETON_HEAD_PART)
+            continue;
+        jointAIndex = ReadU32(bone);
+        jointBIndex = ReadU32(bone + 4u);
+        if (jointAIndex >= SHOT_SKELETON_JOINT_COUNT || jointBIndex >= SHOT_SKELETON_JOINT_COUNT)
+            continue;
+        start = *(volatile float *)(bone + 8u);
+        end = *(volatile float *)(bone + 0xCu);
+        if (!IsFinite(start) || !IsFinite(end) || end <= start || start < -2.0f || end > 4.0f)
+            continue;
+        jointAFrame = ReadU32(skeleton + jointAIndex * 4u);
+        jointBFrame = ReadU32(skeleton + jointBIndex * 4u);
+        if (!ReadFrameWorldPosition(jointAFrame, &jointA) ||
+            !ReadFrameWorldPosition(jointBFrame, &jointB))
+            continue;
+        axis = Subtract(jointB, jointA);
+        if (Dot(axis, axis) < 0.0001f || Dot(axis, axis) > 9.0f)
+            continue;
+        along = (start + end) * 0.5f;
+        headPoint->x = jointA.x + axis.x * along;
+        headPoint->y = jointA.y + axis.y * along;
+        headPoint->z = jointA.z + axis.z * along;
+        if (g_animatedHeadForward > 0.0f)
+        {
+            Vector3 faceDirection;
+            if (ReadVector(jointBFrame + FRAME_WORLD_FORWARD_OFFSET, &faceDirection))
+            {
+                faceDirection.y = 0.0f;
+                if (Normalize(&faceDirection))
+                {
+                    headPoint->x += faceDirection.x * g_animatedHeadForward;
+                    headPoint->z += faceDirection.z * g_animatedHeadForward;
+                }
+            }
+        }
+        if (IsFinite(headPoint->x) && IsFinite(headPoint->y) && IsFinite(headPoint->z))
+            return 1;
+    }
+    return 0;
+}
+
+static void GetAimPointPosition(uintptr_t target, Vector3 origin, Vector3 *aimPoint)
+{
+    *aimPoint = origin;
+    if (g_aimZone > 0 && g_animatedHeadAim && ReadAnimatedHeadPoint(target, aimPoint))
+        return;
+    aimPoint->y += AimPointHeightForTarget(target);
+}
+
 static int ListBounds(uintptr_t world, uintptr_t *begin, uintptr_t *count)
 {
     uintptr_t b = ReadU32(world + WORLD_LIST_BEGIN_OFFSET);
@@ -234,30 +472,56 @@ static int TargetStillValid(uintptr_t world, uintptr_t player, uintptr_t target,
 static uintptr_t FindNearestPed(uintptr_t world, uintptr_t player, Vector3 cameraPosition,
                                 Vector3 cameraForward, Vector3 *targetPosition)
 {
-    uintptr_t begin, count, i, nearest = 0;
+    uintptr_t begin, count, i, nearest = 0, nearestEnemy = 0;
     float best = MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE;
+    float bestEnemy = MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE;
+    Vector3 nearestPosition = {0.0f, 0.0f, 0.0f};
+    Vector3 enemyPosition = {0.0f, 0.0f, 0.0f};
     if (!ListBounds(world, &begin, &count))
         return 0;
     for (i = 0; i < count; ++i)
     {
         uintptr_t object = ReadU32(begin + i * 4u);
-        Vector3 position, direction;
+        Vector3 position, aimPosition, direction;
+        int priorityEnemy;
         float distanceSquared;
         if (object == player || !IsLivePed(object, &position))
             continue;
-        position.y += g_aimHeight;
-        direction = Subtract(position, cameraPosition);
+        priorityEnemy = IsPriorityEnemyPed(object);
+        GetAimPointPosition(object, position, &aimPosition);
+        direction = Subtract(aimPosition, cameraPosition);
         distanceSquared = Dot(direction, direction);
-        if (distanceSquared < 0.25f || distanceSquared > best || !Normalize(&direction))
+        if (distanceSquared < 0.25f || distanceSquared > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE ||
+            !Normalize(&direction))
             continue;
-        if (Dot(direction, cameraForward) < MIN_FORWARD_DOT)
+        if (Dot(direction, cameraForward) <
+            (priorityEnemy ? ENEMY_PRIORITY_FORWARD_DOT : MIN_FORWARD_DOT))
             continue;
-        best = distanceSquared;
-        nearest = object;
-        *targetPosition = position;
+        if (!HasLineOfSight(cameraPosition, aimPosition))
+            continue;
+        if (priorityEnemy)
+        {
+            if (distanceSquared < bestEnemy)
+            {
+                bestEnemy = distanceSquared;
+                nearestEnemy = object;
+                enemyPosition = position;
+            }
+        }
+        else if (distanceSquared < best)
+        {
+            best = distanceSquared;
+            nearest = object;
+            nearestPosition = position;
+        }
+    }
+    if (nearestEnemy)
+    {
+        *targetPosition = enemyPosition;
+        return nearestEnemy;
     }
     if (nearest)
-        targetPosition->y -= g_aimHeight;
+        *targetPosition = nearestPosition;
     return nearest;
 }
 
@@ -266,33 +530,76 @@ static uintptr_t FindAdjacentPed(uintptr_t world, uintptr_t player, Vector3 came
                                  Vector3 cameraForward, uintptr_t current, int side)
 {
     uintptr_t begin, count, i, found = 0;
-    Vector3 currentPosition, direction;
-    float currentBearing, bestDelta = SWITCH_MAX_ANGLE;
+    Vector3 currentPosition, currentAimPosition, direction;
+    float currentBearing, bestDelta = SWITCH_MAX_ANGLE, bestEnemyDelta = SWITCH_MAX_ANGLE;
+    uintptr_t foundEnemy = 0;
     if (!ListBounds(world, &begin, &count) || !IsLivePed(current, &currentPosition))
         return 0;
-    currentPosition.y += g_aimHeight;
-    direction = Subtract(currentPosition, cameraPosition);
+    GetAimPointPosition(current, currentPosition, &currentAimPosition);
+    direction = Subtract(currentAimPosition, cameraPosition);
     currentBearing = atan2f(direction.x, direction.z);
     for (i = 0; i < count; ++i)
     {
         uintptr_t object = ReadU32(begin + i * 4u);
-        Vector3 position;
+        Vector3 position, aimPosition;
         float distanceSquared, delta;
         if (object == player || object == current || !IsLivePed(object, &position))
             continue;
-        position.y += g_aimHeight;
-        direction = Subtract(position, cameraPosition);
+        GetAimPointPosition(object, position, &aimPosition);
+        direction = Subtract(aimPosition, cameraPosition);
         distanceSquared = Dot(direction, direction);
         if (distanceSquared < 0.25f || distanceSquared > MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE ||
             !Normalize(&direction) || Dot(direction, cameraForward) < SWITCH_MIN_FORWARD_DOT)
             continue;
         delta = WrapAngle(atan2f(direction.x, direction.z) - currentBearing) * (float)side;
-        if (delta < SWITCH_MIN_DELTA || delta >= bestDelta)
+        if (delta < SWITCH_MIN_DELTA)
             continue;
-        bestDelta = delta;
-        found = object;
+        if (!HasLineOfSight(cameraPosition, aimPosition))
+            continue;
+        if (IsPriorityEnemyPed(object))
+        {
+            if (delta < bestEnemyDelta)
+            {
+                bestEnemyDelta = delta;
+                foundEnemy = object;
+            }
+        }
+        else if (delta < bestDelta)
+        {
+            bestDelta = delta;
+            found = object;
+        }
     }
-    return found;
+    return foundEnemy ? foundEnemy : found;
+}
+
+static uintptr_t FindNearestPriorityEnemyPed(uintptr_t world, uintptr_t player,
+                                             Vector3 cameraPosition, Vector3 cameraForward,
+                                             Vector3 *targetPosition)
+{
+    uintptr_t begin, count, i, nearest = 0;
+    float best = MAX_TARGET_DISTANCE * MAX_TARGET_DISTANCE;
+    if (!g_prioritizeEnemies || !ListBounds(world, &begin, &count))
+        return 0;
+    for (i = 0; i < count; ++i)
+    {
+        uintptr_t object = ReadU32(begin + i * 4u);
+        Vector3 position, aimPosition, direction;
+        float distanceSquared;
+        if (object == player || !IsPriorityEnemyPed(object) || !IsLivePed(object, &position))
+            continue;
+        GetAimPointPosition(object, position, &aimPosition);
+        direction = Subtract(aimPosition, cameraPosition);
+        distanceSquared = Dot(direction, direction);
+        if (distanceSquared < 0.25f || distanceSquared > best || !Normalize(&direction) ||
+            Dot(direction, cameraForward) < ENEMY_PRIORITY_FORWARD_DOT ||
+            !HasLineOfSight(cameraPosition, aimPosition))
+            continue;
+        best = distanceSquared;
+        nearest = object;
+        *targetPosition = position;
+    }
+    return nearest;
 }
 
 /* ---- settings (MafiaAimAssist.ini beside Game.exe, re-read every second) -- */
@@ -377,6 +684,12 @@ static void ReloadConfig(LONGLONG now)
     g_cfg.deadzone = ClampInt((int)GetPrivateProfileIntA("aim", "stick_deadzone", 15, g_iniPath), 0, 60);
     g_cfg.aimResponse = ClampInt((int)GetPrivateProfileIntA("aim", "aim_response_percent", 70, g_iniPath), 25, 150);
     g_cfg.switchStick = ClampInt((int)GetPrivateProfileIntA("aim", "target_switch_stick", 2, g_iniPath), 0, 2);
+    g_prioritizeEnemies = GetPrivateProfileIntA("aim", "prioritize_enemies", 1, g_iniPath) != 0;
+    g_crouchAwareHeadAim = GetPrivateProfileIntA("aim", "experimental_crouch_head_aim", 1, g_iniPath) != 0;
+    g_animatedHeadAim = GetPrivateProfileIntA("aim", "animated_head_aim", 1, g_iniPath) != 0;
+    g_animatedHeadForward = (float)ClampInt((int)GetPrivateProfileIntA(
+        "aim", "animated_head_forward_cm", 8, g_iniPath), 0, 25) / 100.0f;
+    g_losEnabled = GetPrivateProfileIntA("aim", "require_line_of_sight", 1, g_iniPath) != 0;
     {
         char keyName[32];
         GetPrivateProfileStringA("aim", "aim_key", "O", keyName, sizeof(keyName), g_iniPath);
@@ -480,16 +793,35 @@ static int AimButtonHeld(void)
 static int StickFlick(void)
 {
     static int armed = 1;
-    float x;
+    float x, y;
     if (!g_padOk || g_cfg.switchStick == 0)
         return 0;
     x = (float)(g_cfg.switchStick == 1 ? g_pad.gamepad.thumbLX : g_pad.gamepad.thumbRX) / 32767.0f;
+    y = (float)(g_cfg.switchStick == 1 ? g_pad.gamepad.thumbLY : g_pad.gamepad.thumbRY) / 32767.0f;
     if (fabsf(x) < 0.3f)
         armed = 1;
-    else if (armed && fabsf(x) > 0.7f)
+    else if (armed && fabsf(x) > 0.7f && fabsf(x) > fabsf(y) * STICK_FLICK_DOMINANCE)
     {
         armed = 0;
         return x > 0.0f ? 1 : -1;
+    }
+    return 0;
+}
+
+static int AimHeightFlick(void)
+{
+    static int armed = 1;
+    float x, y;
+    if (!g_padOk)
+        return 0;
+    x = (float)g_pad.gamepad.thumbRX / 32767.0f;
+    y = (float)g_pad.gamepad.thumbRY / 32767.0f;
+    if (fabsf(y) < 0.3f)
+        armed = 1;
+    else if (armed && fabsf(y) > 0.7f && fabsf(y) > fabsf(x) * STICK_FLICK_DOMINANCE)
+    {
+        armed = 0;
+        return y > 0.0f ? 1 : -1;
     }
     return 0;
 }
@@ -632,6 +964,11 @@ static int       g_growSteps, g_slowSteps, g_floorHits, g_logSteps, g_stallX, g_
 static LONG      g_lastAssistX, g_lastAssistY;
 static LONGLONG  g_noTargetLogAt;
 static int       g_switchSide;
+static LONGLONG  g_nextLosCheck;
+static int       g_losBlockedChecks;
+static LONGLONG  g_nextEnemySearch;
+static LONGLONG  g_nextSwitchAt;
+static LONGLONG  g_reacquireAfter;
 
 static void ReleaseAim(void)
 {
@@ -645,6 +982,12 @@ static void ReleaseAim(void)
     g_held = 0;
     g_target = 0;
     g_switchSide = 0;
+    g_aimZone = 0;
+    g_nextLosCheck = 0;
+    g_losBlockedChecks = 0;
+    g_nextEnemySearch = 0;
+    g_nextSwitchAt = 0;
+    g_reacquireAfter = 0;
     g_prevError = -1.0f;
     g_K = K_INIT;
     g_growSteps = g_slowSteps = g_floorHits = g_logSteps = 0;
@@ -667,11 +1010,21 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
     if (g_axis[0].gain == 0.0 || g_axis[1].gain == 0.0)
         return;
 
+    if (!g_target && now < g_reacquireAfter)
+    {
+        g_switchSide = 0;
+        return;
+    }
+
     if (!g_target || !TargetStillValid(world, player, g_target, &targetPosition))
     {
         g_target = FindNearestPed(world, player, cameraPosition, cameraForward, &targetPosition);
+        g_reacquireAfter = 0;
         g_prevError = -1.0f;
         g_stallX = g_stallY = 0;
+        g_losBlockedChecks = 0;
+        g_nextLosCheck = now;
+        g_nextEnemySearch = now + ENEMY_RECHECK_INTERVAL_MS;
         if (!g_target)
         {
             g_switchSide = 0;
@@ -682,9 +1035,31 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
             }
             return;
         }
-        Log("target 0x%08lX at %.1f %.1f %.1f", (unsigned long)g_target, targetPosition.x,
-            targetPosition.y, targetPosition.z);
+        Log("target 0x%08lX at %.1f %.1f %.1f enemy_priority=%d", (unsigned long)g_target,
+            targetPosition.x, targetPosition.y, targetPosition.z, IsPriorityEnemyPed(g_target));
     }
+
+    if (g_target && g_prioritizeEnemies && !IsPriorityEnemyPed(g_target) && now >= g_nextEnemySearch)
+    {
+        Vector3 enemyPosition;
+        uintptr_t enemy = FindNearestPriorityEnemyPed(world, player, cameraPosition, cameraForward,
+                                                      &enemyPosition);
+        g_nextEnemySearch = now + ENEMY_RECHECK_INTERVAL_MS;
+        if (enemy)
+        {
+            g_target = enemy;
+            targetPosition = enemyPosition;
+            g_prevError = -1.0f;
+            g_stallX = g_stallY = 0;
+            g_logSteps = 0;
+            g_losBlockedChecks = 0;
+            g_nextLosCheck = now;
+            Log("promoted to enemy target 0x%08lX", (unsigned long)g_target);
+        }
+    }
+
+    if (g_switchSide && now < g_nextSwitchAt)
+        g_switchSide = 0;
 
     if (g_switchSide)
     {
@@ -696,7 +1071,11 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
             g_prevError = -1.0f;
             g_stallX = g_stallY = 0;
             g_logSteps = 0;
-            Log("switched to target 0x%08lX", (unsigned long)g_target);
+            g_losBlockedChecks = 0;
+            g_nextLosCheck = now;
+            g_nextSwitchAt = now + TARGET_SWITCH_COOLDOWN_MS;
+            Log("switched to target 0x%08lX enemy_priority=%d", (unsigned long)g_target,
+                IsPriorityEnemyPed(g_target));
         }
         else
         {
@@ -704,7 +1083,25 @@ static void RunAim(LONG *lx, LONG *ly, uintptr_t world, uintptr_t player, Vector
         }
     }
 
-    targetPosition.y += g_aimHeight;
+    ProbeStanceByte(g_target);
+    GetAimPointPosition(g_target, targetPosition, &targetPosition);
+    if (g_losEnabled && now >= g_nextLosCheck)
+    {
+        g_nextLosCheck = now + LOS_CHECK_INTERVAL_MS;
+        if (HasLineOfSight(cameraPosition, targetPosition))
+            g_losBlockedChecks = 0;
+        else if (++g_losBlockedChecks >= LOS_BLOCKED_DROP_CHECKS)
+        {
+            Log("target behind cover: dropped");
+            g_target = 0;
+            g_switchSide = 0;
+            g_reacquireAfter = now + LOS_REACQUIRE_DELAY_MS;
+            g_prevError = -1.0f;
+            g_stallX = g_stallY = 0;
+            g_losBlockedChecks = 0;
+            return;
+        }
+    }
     direction = Subtract(targetPosition, cameraPosition);
     if (!Normalize(&direction))
         return;
@@ -822,7 +1219,7 @@ static void HandleMouse(LONG *lx, LONG *ly)
 
     ReloadConfig(now);
     PollPad(now);
-    if (g_cfg.stickLook && g_padOk && !(g_cfg.switchStick == 2 && g_target))
+    if (g_cfg.stickLook && g_padOk && !g_target)
         AddStickLook(lx, ly, dt);
 
     held = AimButtonHeld();
@@ -836,10 +1233,33 @@ static void HandleMouse(LONG *lx, LONG *ly)
     if (held)
     {
         int flick = StickFlick();
+        int heightFlick = AimHeightFlick();
         if (flick)
         {
             g_switchSide = flick;
             Log("stick flick %s", flick > 0 ? "right" : "left");
+        }
+        if (heightFlick)
+        {
+            int nextZone = heightFlick > 0 ? 1 : -1;
+            g_aimZone = g_aimZone == nextZone ? 0 : nextZone;
+            g_prevError = -1.0f;
+            g_remX = g_remY = 0.0f;
+            g_losBlockedChecks = 0;
+            g_nextLosCheck = 0;
+            if (g_aimZone > 0 && g_animatedHeadAim && g_target)
+            {
+                Vector3 headPoint;
+                if (ReadAnimatedHeadPoint(g_target, &headPoint))
+                    Log("aim point head (animated skeleton, forward offset %.0f cm)",
+                        g_animatedHeadForward * 100.0f);
+                else
+                    Log("aim point head (fallback %.0f cm)", AimPointHeightForTarget(g_target) * 100.0f);
+            }
+            else
+                Log("aim point %s (%.0f cm)", g_aimZone > 0 ? "head" :
+                    (g_aimZone < 0 ? "lower torso" : "torso"),
+                    AimPointHeightForTarget(g_target) * 100.0f);
         }
     }
 

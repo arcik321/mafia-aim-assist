@@ -51,6 +51,7 @@ mod, so leave them unassigned.
 | Left / Right | `Joy0 / X Axis / -` and `Joy0 / X Axis / +` |
 | Look around | right stick (handled by the mod) |
 | Lock-on aim | hold the left trigger (handled by the mod) |
+| Aim height while locked | Flick right stick up for head height or down for lower torso; repeat the same direction to return to torso |
 
 Buttons are numbered by Xidi like this: A = 1, B = 2, X = 3, Y = 4, LB = 5, RB = 6, LT = 7, RT = 8, Back = 9,
 Start = 10, left stick click = 11, right stick click = 12. A comfortable layout is Fire = `Joy0 / Button 8` (RT),
@@ -90,10 +91,15 @@ logs listed under [Troubleshooting](#troubleshooting).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `aim_height_cm` | `95` | Aim point above the target's feet. The default hits the torso of a standing person and the chest of a crouching one. Use about `120` to aim at the head of standing targets. |
+| `aim_height_cm` | `95` | Base aim point above the target's feet. While locked, flick the right stick up to raise the aim point toward the head, down for the lower torso, or repeat a flick to return to this base height. |
+| `animated_head_aim` | `1` | Use the target's animated head/neck capsule when head aim is selected; fall back to a height offset if the model has no usable skeleton. Set `0` to disable. |
+| `animated_head_forward_cm` | `8` | Horizontal head-point offset toward the target's facing direction, in centimetres (`0` to `25`). Set `0` to disable. |
+| `experimental_crouch_head_aim` | `1` | Fallback only: lower the height-based head point when the target's `+0x1e4` byte is nonzero. |
 | `aim_key` | `O` | Keyboard key for lock-on. Set one letter/digit, `F1`-`F12`, `SPACE`, `ENTER`, `TAB`, `ESC`, `SHIFT`, `CTRL`, `ALT`, `CAPSLOCK` or `BACKSPACE`. The left trigger remains enabled. |
 | `aim_response_percent` | `70` | Lock-on strength. Lower it for a slower approach; accepted range is `25` to `150`. Changes are read while the game runs. |
-| `target_switch_stick` | `2` | While locked on, flick this stick sideways to switch to the nearest person on that side: `2` right stick (it does not look around while a target is locked), `1` left stick (also moves the character), `0` off. |
+| `require_line_of_sight` | `1` | Require an unobstructed collision line to acquire or keep a target. Set `0` to disable. If the supported game function cannot be validated, the mod logs the issue and falls back to the previous targeting behavior. |
+| `prioritize_enemies` | `1` | Prefer scripted mission enemies (AI group 4) over other NPCs, including promoting an existing civilian lock when an enemy is visible. Enemies are searched within a wider 25-degree cone; civilians remain limited to 10 degrees. Falls back to another eligible person if no group-4 target is available; set `0` to disable. |
+| `target_switch_stick` | `2` | While locked on, make a horizontal-dominant flick to switch to the nearest person on that side. Vertical-dominant flicks are reserved for aim zones; switches have a short debounce. `2` right stick, `1` left stick, `0` off. |
 | `right_stick_look` | `1` | Right stick moves the camera. Set `0` to disable. |
 | `look_x_speed`, `look_y_speed` | `1100`, `1000` | Camera speed at full deflection, mouse counts per second. |
 | `invert_y` | `0` | `1` inverts the vertical look direction. |
@@ -118,10 +124,10 @@ release, both version 1.3. Older retail builds are not supported.
 
 ## Known limitations
 
-- It locks onto the nearest living pedestrian in front of the camera. It does not know friend from foe, so it may
-  pick a civilian.
-- It does not currently test line of sight. A pedestrian behind a wall can still be selected; reliable wall blocking
-  needs a game collision/raycast query that has not yet been identified for this build.
+- Enemy priority uses the mission AI group, not a universal friend/foe flag. If no eligible group-4 target is in
+  the search area, the mod falls back to another living pedestrian, which may be a civilian.
+- Line-of-sight filtering uses the supported Game.exe 1.3 collision query. If its wrapper signature does not match,
+  filtering is disabled and the previous targeting behavior is retained.
 - Disabled while driving.
 - It replaces `dinput8.dll`, so it cannot be combined with other mods that use the same file name.
 
