@@ -1,7 +1,7 @@
 @echo off
 rem Builds the mod and assembles dist\MafiaAimAssist-<version>.zip. Needs Visual Studio with the C++ desktop tools.
 setlocal EnableDelayedExpansion
-set "VERSION=1.0.3"
+set "VERSION=1.0.4"
 set "ROOT=%~dp0"
 set "BUILD=%ROOT%build"
 set "PKG=%ROOT%dist\MafiaAimAssist-%VERSION%"
